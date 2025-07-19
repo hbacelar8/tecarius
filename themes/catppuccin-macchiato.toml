@@ -1,0 +1,12 @@
+[ui]
+background = 0x24273a
+border = 0x6e738d
+key = 0x81c8be
+
+[text]
+title = 0xa6d189
+text = 0xf2d5cf
+
+[input]
+typing = 0xf2d5cf
+normal = 0x6e738d
