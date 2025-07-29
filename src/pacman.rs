@@ -4,11 +4,9 @@ use chrono::{DateTime, Local, TimeZone};
 use pacmanconf::Config;
 use std::{
     cmp::Ordering,
-    io::BufReader,
     process::{ChildStdout, Command, Stdio},
 };
 
-#[allow(dead_code)]
 pub struct PackageData<'a> {
     pub name: &'a str,
     pub version: &'a Ver,
@@ -102,15 +100,17 @@ impl Pacman {
             }
         })
     }
+}
 
-    pub fn upgrade(&self, packages: &[String]) -> error::Result<ChildStdout> {
-        let mut process = Command::new("pacman")
-            .args(["-S", "--needed", "--noconfirm"])
-            .args(packages)
-            .stdout(Stdio::piped())
-            .spawn()?;
-        let stdout = process.stdout.take().unwrap();
+pub fn sync_packages<'a>(
+    packages: impl IntoIterator<Item = &'a str>,
+) -> error::Result<ChildStdout> {
+    let mut process = Command::new("pacman")
+        .args(["-S", "--needed", "--noconfirm"])
+        .args(packages)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = process.stdout.take().unwrap();
 
-        Ok(stdout)
-    }
+    Ok(stdout)
 }

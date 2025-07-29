@@ -26,11 +26,11 @@ pub fn to_human_bytes<T: Into<f64>>(bytes: T) -> String {
 }
 
 /// Create a block widget with optionals title and legend.
-pub fn create_block(
+pub fn create_block<'a>(
     title: Option<String>,
     legend: Option<String>,
     colors: &Colors,
-) -> Block<'static> {
+) -> Block<'a> {
     let mut block = Block::new()
         .bg(Color::from_u32(colors.ui.background))
         .fg(Color::from_u32(colors.ui.border))

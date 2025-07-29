@@ -1,5 +1,7 @@
+use crate::keyboard::KeyboardEvent;
 use std::{env, io};
 use thiserror::Error;
+use tokio::sync::watch::error;
 use toml::de;
 
 /// Result type alias.
@@ -25,4 +27,10 @@ pub enum Error {
 
     #[error("Failed to access super-user rights.")]
     SuperUserError,
+
+    #[error("Failed to send event between tasks")]
+    EventSendError(#[from] error::SendError<KeyboardEvent>),
+
+    #[error("Failed to receive event between tasks")]
+    EventReceiveError(#[from] error::RecvError),
 }

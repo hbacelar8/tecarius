@@ -1,10 +1,15 @@
-use crate::{config::Colors, error, pacman::Pacman, utils::create_block};
+use crate::{
+    config::Colors,
+    error,
+    keyboard::{Events, KeyboardEvent, Move, read_event},
+    pacman::Pacman,
+    utils::create_block,
+};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Flex, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::Line,
     widgets::{
@@ -12,20 +17,22 @@ use ratatui::{
         Tabs, Widget,
     },
 };
-use std::{io::Read, ops::Not, process::ChildStdout};
+use std::collections::HashSet;
 use strum::IntoEnumIterator;
+use sync::SyncWidget;
 use tabs::DependenciesTabs;
 use tui_input::{Input, backend::crossterm::EventHandler};
 
+mod sync;
 mod tabs;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum State {
-    Exiting,
     #[default]
     Normal,
-    Typing,
-    Upgrading,
+    Searching,
+    Syncing(bool),
+    Exiting,
 }
 
 pub struct App {
@@ -35,10 +42,10 @@ pub struct App {
     pacman: Pacman,
     list_state: ListState,
     dependencies_tabs: DependenciesTabs,
+    sync_widget: SyncWidget,
     input: Input,
     search_matcher: SkimMatcherV2,
-    selected_packages: Vec<String>,
-    stdout: Option<ChildStdout>,
+    selected_packages: HashSet<String>,
 }
 
 impl App {
@@ -50,22 +57,94 @@ impl App {
             pacman,
             list_state: Default::default(),
             dependencies_tabs: Default::default(),
+            sync_widget: Default::default(),
             input: Default::default(),
             search_matcher: Default::default(),
-            selected_packages: Vec::new(),
-            stdout: None,
+            selected_packages: HashSet::new(),
         }
     }
 
-    pub fn run(mut self, terminal: &mut DefaultTerminal) -> error::Result<()> {
+    pub async fn run(mut self, terminal: &mut DefaultTerminal) -> error::Result<()> {
         self.list_state.select_first();
 
         while self.state != State::Exiting {
             terminal.draw(|frame| self.draw(frame))?;
-            self.handle_event(event::read()?);
+            self.handle_keyboard_event(read_event().await);
         }
 
         Ok(())
+    }
+
+    pub fn handle_keyboard_event(&mut self, keyboard_event: KeyboardEvent) {
+        match self.state {
+            State::Normal => {
+                if let Some(event) = keyboard_event.event {
+                    match event {
+                        Events::Quit => self.state = State::Exiting,
+                        Events::Search => self.state = State::Searching,
+                        Events::Filter => self.filter_upgradables = !self.filter_upgradables,
+                        Events::Select => self.toggle_package_selection(),
+                        Events::SelectUpgradables => self.toggle_upgradable_packages(),
+                        Events::Sync => self.upgrade_packages(),
+                        Events::Navigate(mov) => match mov {
+                            Move::First => self.list_state.select_first(),
+                            Move::Last => self.list_state.select_last(),
+                            Move::Next => self.list_state.select_next(),
+                            Move::Previous => self.list_state.select_previous(),
+                            Move::JumpUp => self.jump_up(),
+                            Move::JumpDown => self.jump_down(),
+                        },
+                        Events::Tab(mov) => match mov {
+                            Move::Next => self.next_tab(),
+                            Move::Previous => self.previous_tab(),
+                            _ => (),
+                        },
+                        Events::Back => {
+                            if !self.input.value_and_reset().is_empty() {
+                            } else {
+                                self.state = State::Exiting
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+            }
+
+            State::Searching => {
+                if let Some(event) = keyboard_event.event {
+                    match event {
+                        Events::Confirm => self.state = State::Normal,
+                        Events::Back => {
+                            self.input.reset();
+                            self.state = State::Normal;
+                        }
+                        _ => _ = self.input.handle_event(&keyboard_event.raw),
+                    }
+                } else {
+                    self.input.handle_event(&keyboard_event.raw);
+                }
+            }
+
+            State::Syncing(_) => {
+                if let Some(event) = keyboard_event.event {
+                    match event {
+                        Events::Navigate(mov) => match mov {
+                            Move::Next => self.sync_widget.next(),
+                            Move::Previous => self.sync_widget.previous(),
+                            _ => (),
+                        },
+                        Events::Back => self.state = State::Normal,
+                        Events::Confirm => {
+                            self.state = State::Syncing(true);
+                            self.sync_widget.start_sync();
+                        }
+                        _ => (),
+                    }
+                }
+            }
+
+            _ => (),
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -94,58 +173,12 @@ impl App {
         self.render_general_info(general_info_area, frame.buffer_mut());
         self.render_tabs(tabs_header_area, tabs_inner_area, frame.buffer_mut());
 
-        if self.state == State::Upgrading {
-            let popup_area = popup_area(area, 70, 70);
+        if let State::Syncing(_) = self.state {
+            let popup_area = SyncWidget::area(area, 70, 60);
             frame.render_widget(Clear, popup_area);
-            self.render_popup(popup_area, frame.buffer_mut());
-        }
-    }
-
-    fn handle_event(&mut self, event: Event) {
-        if let Event::Key(key) = event {
-            if key.kind != KeyEventKind::Press {
-                return;
-            }
-
-            match self.state {
-                State::Normal => match (key.modifiers, key.code) {
-                    (_, KeyCode::Char('j')) | (_, KeyCode::Down) => self.list_state.select_next(),
-                    (_, KeyCode::Char('k')) | (_, KeyCode::Up) => self.list_state.select_previous(),
-                    (_, KeyCode::Char('g')) | (_, KeyCode::Home) => self.list_state.select_first(),
-                    (_, KeyCode::Char('G')) | (_, KeyCode::End) => self.list_state.select_last(),
-                    (KeyModifiers::CONTROL, KeyCode::Char('u')) => self.jump_up(),
-                    (KeyModifiers::CONTROL, KeyCode::Char('d')) => self.jump_down(),
-                    (KeyModifiers::ALT, KeyCode::Char('u')) => {
-                        self.filter_upgradables = self.filter_upgradables.not();
-                    }
-                    (KeyModifiers::SHIFT, KeyCode::Char('S')) => self.upgrade_packages(),
-                    (_, KeyCode::Char('x')) => self.toggle_package_selection(),
-                    (_, KeyCode::Char('q')) => self.state = State::Exiting,
-                    (_, KeyCode::Char('/')) => self.state = State::Typing,
-                    (_, KeyCode::Tab) => self.next_tab(),
-                    (_, KeyCode::BackTab) => self.previous_tab(),
-                    (_, KeyCode::Esc) => {
-                        if self.input.value() != "" {
-                            self.input.reset();
-                        } else {
-                            self.state = State::Exiting
-                        }
-                    }
-                    _ => (),
-                },
-                State::Typing => match key.code {
-                    KeyCode::Enter => self.state = State::Normal,
-                    KeyCode::Esc => self.flush_editing(),
-                    _ => {
-                        self.input.handle_event(&event);
-                    }
-                },
-                State::Upgrading => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => self.state = State::Normal,
-                    _ => (),
-                },
-                _ => (),
-            }
+            let vals: Vec<&str> = self.selected_packages.iter().map(String::as_ref).collect();
+            self.sync_widget
+                .render(popup_area, frame.buffer_mut(), &self.colors, vals);
         }
     }
 
@@ -157,11 +190,6 @@ impl App {
         self.list_state.scroll_down_by(25);
     }
 
-    fn flush_editing(&mut self) {
-        self.state = State::Normal;
-        self.input.reset();
-    }
-
     fn next_tab(&mut self) {
         self.dependencies_tabs = self.dependencies_tabs.next();
     }
@@ -171,8 +199,10 @@ impl App {
     }
 
     fn upgrade_packages(&mut self) {
-        self.state = State::Upgrading;
-        self.stdout = self.pacman.upgrade(&self.selected_packages).ok();
+        if !self.selected_packages.is_empty() {
+            self.state = State::Syncing(false);
+        }
+        // self.stdout = self.pacman.upgrade(&self.selected_packages).ok();
     }
 
     fn toggle_package_selection(&mut self) {
@@ -199,9 +229,29 @@ impl App {
                 .unwrap();
 
             if self.selected_packages.contains(&package_name) {
-                self.selected_packages.retain(|name| *name != package_name)
+                self.selected_packages.remove(&package_name);
             } else {
-                self.selected_packages.push(package_name);
+                self.selected_packages.insert(package_name);
+            }
+        }
+    }
+
+    fn toggle_upgradable_packages(&mut self) {
+        let package_names = self.pacman.packages().filter_map(|pkg| {
+            if pkg.new_version.is_some() {
+                Some(pkg.name.to_string())
+            } else {
+                None
+            }
+        });
+
+        if self.selected_packages.is_empty() {
+            for name in package_names {
+                self.selected_packages.insert(name);
+            }
+        } else {
+            for name in package_names {
+                self.selected_packages.remove(&name);
             }
         }
     }
@@ -233,7 +283,7 @@ impl App {
                         .is_some()
                         && pkg.new_version.is_some()
                     {
-                        if self.selected_packages.contains(&pkg.name.to_string()) {
+                        if self.selected_packages.contains(pkg.name) {
                             Some(ListItem::from(format!("  {}  ", pkg.name)))
                         } else if !self.selected_packages.is_empty() {
                             Some(ListItem::from(format!("  {}  ", pkg.name)))
@@ -254,7 +304,7 @@ impl App {
                         .map(|_| {
                             match (
                                 pkg.new_version.is_some(),
-                                self.selected_packages.contains(&pkg.name.to_string()),
+                                self.selected_packages.contains(pkg.name),
                                 self.selected_packages.is_empty(),
                             ) {
                                 (true, true, _) => ListItem::from(format!("  {}  ", pkg.name)),
@@ -279,7 +329,7 @@ impl App {
 
         let block = create_block(
             Some(format!(
-                " packages   ({} 󰏖  {}  ) ",
+                " packages   ({} 󰏖  {}  ) ",
                 total_packages, upgradable_count
             )),
             Some("↑↓ (k/j) (g/G) (c-d/c-u) | filter (alt+u)".to_string()),
@@ -303,11 +353,11 @@ impl App {
         let width = area.width.max(3) - 3;
         let scroll = self.input.visual_scroll(width as usize);
         let block = match self.state {
-            State::Typing => block.border_style(Color::from_u32(self.colors.ui.key)),
+            State::Searching => block.border_style(Color::from_u32(self.colors.ui.key)),
             _ => block.border_style(Color::from_u32(self.colors.ui.border)),
         };
         let style = match self.state {
-            State::Typing => Color::from_u32(self.colors.input.typing),
+            State::Searching => Color::from_u32(self.colors.input.typing),
             _ => Color::from_u32(self.colors.input.normal),
         };
 
@@ -415,27 +465,4 @@ impl App {
                 .render(inner_area, buf, &package, &self.colors);
         }
     }
-
-    fn render_popup(&mut self, area: Rect, buf: &mut Buffer) {
-        let block = create_block(Some(" upgrading ".to_string()), None, &self.colors);
-        let mut st = String::new();
-        if let Some(stdout) = self.stdout.as_mut() {
-            stdout.read_to_string(&mut st).unwrap();
-        }
-
-        Paragraph::new(st)
-            .block(block)
-            .bg(Color::from_u32(self.colors.ui.background))
-            .fg(Color::from_u32(self.colors.text.text))
-            .render(area, buf);
-    }
-}
-
-/// helper function to create a centered rect using up certain percentage of the available rect `r`
-fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let vertical = Layout::vertical([Constraint::Percentage(percent_y)]).flex(Flex::Center);
-    let horizontal = Layout::horizontal([Constraint::Percentage(percent_x)]).flex(Flex::Center);
-    let [area] = vertical.areas(area);
-    let [area] = horizontal.areas(area);
-    area
 }
