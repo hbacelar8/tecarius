@@ -1,4 +1,5 @@
 use nix::unistd::Uid;
+use std::process::exit;
 use tecarius::{app::App, config, error, pacman::Pacman};
 
 #[tokio::main]
@@ -9,21 +10,16 @@ async fn main() -> error::Result<()> {
     // Check super-user rights
     if !Uid::effective().is_root() {
         eprintln!("Tecarius must be run with root permissions.");
-        return Err(error::Error::SuperUserError);
+        exit(1);
     }
 
-    // Init pacman
     let pacman = Pacman::new()?;
-
-    // Init terminal
-    let mut terminal = ratatui::init();
-
-    // Init and run application
-    let app = App::new(pacman, theme_colors);
-    let app_result = app.run(&mut terminal);
+    let result = App::new(pacman, theme_colors)
+        .run(&mut ratatui::init())
+        .await;
 
     // Restore terminal
     ratatui::restore();
 
-    app_result
+    result
 }
